@@ -1,5 +1,6 @@
 import os
 import random
+import time
 import webbrowser
 import json
 import customtkinter as ctk
@@ -18,14 +19,15 @@ os.makedirs(MUSIC_DIR, exist_ok=True)
 # =============================================================
 # STATE
 # =============================================================
-playlist       = []       # [{"type": "mp3"|"yt", "value": str, "label": str}]
-current_index  = -1
-paused         = False
-song_length    = 0
-seeking        = False
-shuffle_mode   = False
-repeat_mode    = False
-dark_mode      = True
+playlist        = []
+current_index   = -1
+paused          = False
+song_start_time = 0.0
+song_length     = 0.0
+seeking         = False
+shuffle_mode    = False
+repeat_mode     = False
+dark_mode       = True
 
 # =============================================================
 # COLORS
@@ -50,34 +52,26 @@ def load_config():
         with open(CONFIG_FILE, encoding="utf-8") as f:
             cfg = json.load(f)
 
-        # Dark mode — ใช้เปลี่ยนธีมจริง
         dark_mode = cfg.get("dark_mode", True)
         ctk.set_appearance_mode("dark" if dark_mode else "light")
-        theme_btn.configure(text="🌙" if dark_mode else "☀️")
+        theme_btn.configure(text="" if dark_mode else "☀️")
 
-        # Volume
         vol = cfg.get("volume", 0.8)
         volume_slider.set(vol)
         pygame.mixer.music.set_volume(vol)
         vol_label.configure(text=f"🔊 {int(vol * 100)}%")
 
-        # Shuffle / Repeat (sync UI โดยไม่สลับค่า)
         shuffle_mode = cfg.get("shuffle_mode", False)
         repeat_mode  = cfg.get("repeat_mode", False)
         _sync_shuffle_ui()
         _sync_repeat_ui()
 
-        # เพลงล่าสุด
         idx = cfg.get("last_song_index", 0)
         if playlist and 0 <= idx < len(playlist):
             current_index = idx
             _highlight_current()
             _update_song_label(playlist[idx]["label"])
             _update_status(f"📌 เพลงล่าสุด: {playlist[idx]['label']}")
-
-        # Window size
-        size = cfg.get("window_size", "500x760")
-        root.geometry(size)
 
     except Exception as e:
         print("⚠️ โหลด config ผิดพลาด:", e)
@@ -91,7 +85,6 @@ def save_config():
             "shuffle_mode":    shuffle_mode,
             "repeat_mode":     repeat_mode,
             "last_song_index": current_index,
-            "window_size":     root.geometry(),
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -104,11 +97,15 @@ def save_config():
 def load_playlist():
     playlist.clear()
     playlist_box.delete(0, tk.END)
-    for f in sorted(os.listdir(MUSIC_DIR)):
-        if f.lower().endswith(".mp3"):
-            label = os.path.splitext(f)[0]
-            playlist.append({"type": "mp3", "value": f, "label": label})
-            playlist_box.insert(tk.END, f"  🎵  {label}")
+    try:
+        files = sorted(os.listdir(MUSIC_DIR))
+        for f in files:
+            if f.lower().endswith(".mp3"):
+                label = os.path.splitext(f)[0]
+                playlist.append({"type": "mp3", "value": f, "label": label})
+                playlist_box.insert(tk.END, f"    {label}")
+    except Exception as e:
+        print("⚠️ โหลด playlist ผิดพลาด:", e)
     _update_status(f"โหลดแล้ว {len(playlist)} เพลง")
 
 
@@ -126,7 +123,7 @@ def _highlight_current():
 # PLAYER CORE
 # =============================================================
 def load_song(index, force_play=True):
-    global current_index, paused, song_length
+    global current_index, paused, song_start_time, song_length
 
     if not playlist or not (0 <= index < len(playlist)):
         return
@@ -146,16 +143,28 @@ def load_song(index, force_play=True):
         return
 
     try:
+        pygame.mixer.music.stop()
         pygame.mixer.music.load(path)
+
         if force_play:
             pygame.mixer.music.play()
             pygame.mixer.music.set_volume(volume_slider.get())
-            song_length = pygame.mixer.Sound(path).get_length()
+
+            try:
+                sound = pygame.mixer.Sound(path)
+                song_length = sound.get_length()
+                sound = None
+            except Exception:
+                song_length = 0.0
+
+            song_start_time = time.time()
             paused = False
-            play_btn.configure(text="⏸")
-        _update_status(f"🎶  {item['label']}")
+            play_btn.configure(text="")
+
+        _update_status(f"  {item['label']}")
         _highlight_current()
         _update_song_label(item["label"])
+
     except Exception as e:
         messagebox.showerror("เกิดข้อผิดพลาด", str(e))
 
@@ -167,7 +176,7 @@ def _update_song_label(name):
 
 
 def play_pause(event=None):
-    global paused
+    global paused, song_start_time
     if not playlist:
         return
     if current_index < 0:
@@ -175,6 +184,9 @@ def play_pause(event=None):
         return
 
     if paused:
+        # คำนวณเวลาเริ่มใหม่เมื่อ resume
+        elapsed_before = (time.time() - song_start_time)
+        song_start_time = time.time() - elapsed_before
         pygame.mixer.music.unpause()
         paused = False
         play_btn.configure(text="⏸")
@@ -255,7 +267,7 @@ def toggle_dark_mode():
     global dark_mode
     dark_mode = not dark_mode
     ctk.set_appearance_mode("dark" if dark_mode else "light")
-    theme_btn.configure(text="🌙" if dark_mode else "☀️")
+    theme_btn.configure(text="" if dark_mode else "☀️")
     save_config()
 
 # =============================================================
@@ -267,16 +279,29 @@ def _fmt(sec):
 
 
 def update_time():
+    global song_length
+
     if pygame.mixer.music.get_busy() and not paused and not seeking:
-        elapsed = pygame.mixer.music.get_pos() / 1000.0
-        if song_length > 0:
-            progress_slider.set(min(elapsed / song_length, 1.0))
+        elapsed = time.time() - song_start_time
+
+        if song_length > 0 and elapsed >= 0:
+            progress = min(elapsed / song_length, 1.0)
+            progress_slider.set(progress)
             time_label.configure(text=f"{_fmt(elapsed)} / {_fmt(song_length)}")
+
+        # ตรวจสอบว่าเพลงจบหรือยัง
+        if elapsed >= song_length:
+            if repeat_mode:
+                load_song(current_index)
+            else:
+                next_song()
+
     elif not pygame.mixer.music.get_busy() and not paused and current_index >= 0:
         if repeat_mode:
             load_song(current_index)
         else:
             next_song()
+
     root.after(400, update_time)
 
 
@@ -286,10 +311,13 @@ def seek_start(event):
 
 
 def seek_song(val):
+    global song_start_time
     if song_length > 0:
         pos = float(val) * song_length
         pygame.mixer.music.play(start=pos)
         pygame.mixer.music.set_volume(volume_slider.get())
+        # ปรับเวลาเริ่มใหม่ตามตำแหน่งที่ seek
+        song_start_time = time.time() - pos
 
 
 def seek_end(event):
@@ -302,7 +330,7 @@ def seek_end(event):
 def set_volume(val):
     pygame.mixer.music.set_volume(float(val))
     vol_pct = int(float(val) * 100)
-    vol_label.configure(text=f"🔊 {vol_pct}%")
+    vol_label.configure(text=f" {vol_pct}%")
 
 # =============================================================
 # ADD / REMOVE FILES
@@ -314,17 +342,17 @@ def add_file():
     )
     added = 0
     for f in files:
-        dest = os.path.join(MUSIC_DIR, os.path.basename(f))
-        if not os.path.exists(dest):
-            try:
+        try:
+            dest = os.path.join(MUSIC_DIR, os.path.basename(f))
+            if not os.path.exists(dest):
                 with open(f, "rb") as src, open(dest, "wb") as dst:
                     dst.write(src.read())
                 added += 1
-            except Exception as e:
-                messagebox.showerror("ข้อผิดพลาด", str(e))
+        except Exception as e:
+            messagebox.showerror("ข้อผิดพลาด", str(e))
     load_playlist()
     if added:
-        messagebox.showinfo("สำเร็จ", f"เพิ่ม {added} เพลงแล้ว 🎶")
+        messagebox.showinfo("สำเร็จ", f"เพิ่ม {added} เพลงแล้ว ")
 
 
 def add_youtube():
@@ -336,7 +364,7 @@ def add_youtube():
     playlist.append({"type": "yt", "value": url, "label": f"YouTube: {label}"})
     playlist_box.insert(tk.END, f"  ▶️  YouTube: {label}")
     yt_entry.delete(0, tk.END)
-    _update_status("📌 เพิ่ม YouTube แล้ว")
+    _update_status(" เพิ่ม YouTube แล้ว")
 
 
 def paste_youtube():
@@ -528,7 +556,7 @@ yt_entry = ctk.CTkEntry(
 )
 yt_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 ctk.CTkButton(
-    yt_frame, text="📋", width=38,
+    yt_frame, text="", width=38,
     fg_color=C_BLUE, hover_color=C_BLUE_H,
     command=paste_youtube
 ).pack(side="left", padx=(0, 4))
